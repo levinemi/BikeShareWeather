@@ -1,0 +1,781 @@
+---
+title: "Bike Share Toronto & Weather"
+author: "levinemi"
+date: "16/06/2020"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+# Introduction
+
+The Bike Share program in Toronto is one way for citizens and tourists to get around the city without cars, taxis, or public transit. Bike stations are located throughout the city. You can pick up a bike at any station, ride it and drop it off at another station when you're done. The bikes are meant for short trips of less than 30 minutes.
+
+Toronto weather varies a lot throughout the year. With warm humid summers and cold snowy winters. The Bike Share program is available all year round. But how does ridership change with Toronto's variable weather? Can you predict the number of rides and length of trips based on weather conditions?
+
+The following analysis uses Bike Share Toronto usage statistics for 2018 from the city's Open Data Portal (https://open.toronto.ca/dataset/bike-share-toronto-ridership-data/). As well as data about daily weather made available by Environment Canada (https://climatedata.ca/download/).
+
+## Load libraries
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(summarytools) #summary tables and cross tabs
+library(tidyr) #data cleaning
+library(lubridate) #date fields
+library(ggplot2) # graphing
+library(VIM) #data imputation
+library(mice) #data imputation
+library(stringr)
+library(caret) #predictive modelling
+library(MASS) #feature selection
+library(leaps) #feature selection
+library(RColorBrewer)#graph colors
+library(dplyr) #data cleaning and wrangling
+library(gridExtra)
+library(car)
+library(PMCMR)
+library(timeDate)
+library(corrplot)
+library(minpack.lm)
+```
+
+
+## Load Bike Share Data for 2018
+```{r}
+#Working directory
+setwd("~/BikeShare")
+
+#Data source: https://open.toronto.ca/dataset/bike-share-toronto-ridership-data/ 
+Q1Bike <- read.csv("Data/Bike Share Toronto Ridership_Q1 2018.csv", stringsAsFactors = F)
+Q2Bike <- read.csv("Data/Bike Share Toronto Ridership_Q2 2018.csv", stringsAsFactors = F)
+Q3Bike <- read.csv("Data/Bike Share Toronto Ridership_Q3 2018.csv", stringsAsFactors = F)
+Q4Bike <- read.csv("Data/Bike Share Toronto Ridership_Q4 2018.csv", stringsAsFactors = F)
+
+#Combine records from Q1 to Q4
+Bike <- bind_rows(Q1Bike, Q2Bike, Q3Bike, Q4Bike)
+```
+
+## Data Preparation and Exploration
+### Missing data
+```{r}
+#Check for records with incomplete cases
+sum(complete.cases(Bike))
+```
+### User Type
+```{r}
+#Convert User Type to factor
+Bike$user_type <- as.factor(Bike$user_type)
+```
+```{r, echo=FALSE}
+#histogram of usertype. Do we have a balanced or imbalanced class?
+Bike %>% 
+  group_by(user_type) %>% 
+  count() %>% 
+  ggplot(aes(x=user_type, y=n, fill=user_type))+
+  geom_bar(stat = "identity")+
+  scale_fill_brewer(palette = "Set2")+
+  ggtitle("Number of Bike Trips in 2018 by User Type")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("User Type")+
+  ylab("Total Trips")+
+  geom_text(aes(label = n), size = 5, vjust = 2, colour = "white")+
+  theme(legend.title = element_blank())+ theme_minimal()
+```
+ 
+### Trip start and end dates
+```{r}
+#Convert the date to date format (use the lubridate package)#start time and date
+Bike$trip_start_time <-mdy_hm(Bike$trip_start_time)
+#stop time and date
+Bike$trip_stop_time <-mdy_hm(Bike$trip_stop_time)
+
+length(unique(date(Bike$trip_start_time)))#365 records
+length(unique(date(Bike$trip_stop_time)))#366 records
+
+Bike$trip_start_time[year(Bike$trip_stop_time)==2019] 
+```
+There are two records where the trip ended on Jan 1, 2019 and both started just a few minutes before midnight. These records are valid for the 2018 analysis
+
+### Trip duration
+```{r, echo=FALSE}
+#Bike trip length
+Bike <- Bike %>% 
+  mutate(trip_duration_min = round(trip_duration_seconds/60, 2))
+
+# of trips longer than 30 min
+sum(Bike$trip_duration_min>30)
+# % of all trips that are longer than 30 min
+round((sum(Bike$trip_duration_min>30)/nrow(Bike))*100,0)
+```
+#### What is the average length of the trips?
+```{r, echo=FALSE}
+Bike %>% 
+  summarise(avg_min = round(mean(trip_duration_seconds)/60 ,2)) 
+
+summary(Bike$trip_duration_seconds)
+
+k<- boxplot(Bike$trip_duration_seconds, col = brewer.pal(3, "Set2"), main="Distribution of Trip Duration (seconds)") 
+
+round(length(k$out)/nrow(Bike), 2)#5% of records appear to be outliers
+round(max(Bike$trip_duration_min)/60, 0)#The longest trip, while outside the norm was within 1 day.
+
+summarytools::freq(sign(k$out-median(Bike$trip_duration_min)))#the outliers all appear to be trips that are longer than the median. 
+
+#remove outliers for trip duration above the upper whisker
+upperwhisker <- k$stats[5]
+
+```
+```{r}
+rm(k)
+```
+Most trips are within the 30 min range provided by Bikeshare. But trip duration has a right skewed distribution. 5% of records are outliers and they all appear to be longer rides than the median.  The longest trip was 15 hours. 
+
+```{r}
+#Crosstab of member type and trip length
+table(Bike$user_type, Bike$trip_duration_min>30)
+```
+Most of the users who exceed the 30 minute time limit are casual users.  Casual users are 2.5x more likely to exceed the time limit than annual members. 
+
+#### How many trips occur over more than one date?
+```{r, echo = FALSE}
+sum(date(Bike$trip_stop_time)-date(Bike$trip_start_time)!=0) #7397 trips occur on more than one date
+sum(date(Bike$trip_stop_time)-date(Bike$trip_start_time)!=0)/nrow(Bike) #0.4% of trips take more than one day
+g <- which(date(Bike$trip_stop_time)-date(Bike$trip_start_time)!=0)
+table(hour(Bike$trip_start_time[g])) # what is the hour when the multi-day trips start? 
+summarytools::freq((hour(Bike$trip_start_time[g])))
+h <- hour(Bike$trip_start_time[g])
+round(sum(h==23)/length(g)*100,0) #86% of multi-day trips begin between 11pm and midnight
+round(sum(h>=21)/length(g)*100, 0) #94% of multi-day trips start between 9 and midnight
+j <- Bike[g[which(h!=23)],] # There are 1036 multi-day trips that begin before 11pm
+range(j$trip_duration_seconds)/60 #The trips that begin earlier than 11pm range from 62 min to 918 min. 
+
+rm(j)
+rm(g)
+rm(h)
+```
+7397 trips occur on more than one date. That means, 0.4% of trips take more than one day. Most multi-day trips begin between 11pm and midnight. The trips that begin earlier than 11pm range from 62 min to 918 min.  Overall, the records for long and multi-day rides seem valid and will not be excluded from analysis.
+
+```{r, echo=FALSE}
+#Plot of Bike Trip Start Time
+Bike %>% count(Hour = hour(trip_start_time)) %>% 
+  ggplot(aes(x=Hour, y=n))+
+  geom_col(fill="#66C2A5")+
+  ggtitle("Number of trips by Start Time")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Time (24hr clock)")+
+  ylab("")+
+  theme(legend.position = "none")+theme_minimal()
+```
+```{r}
+#Create a flag for Weekday or Weekend
+Bike <- Bike %>% mutate(WDay = ifelse((isWeekday(Bike$trip_start_time)==T), 'Weekday', 'Weekend'))
+
+#Plot of Bike Trip Start Time grouped by day of the week
+Bike %>% group_by(WDay, user_type) %>% 
+  count(Hour = hour(trip_start_time)) %>% 
+  ggplot(aes(x=Hour, y=n))+
+  geom_line(aes(color=WDay, linetype=user_type), size=1)+
+  scale_color_brewer(palette = "Set2")+
+  ggtitle("Number of trips by start time, user type and day of the week")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Time (24hr clock)")+
+  geom_vline(xintercept = c(7,8,9,16,17,18), color="grey", size=7, alpha=0.3)+
+  theme_minimal()+
+  theme(legend.title = element_blank(), axis.title.y = element_blank())
+```
+
+```{r}
+summary(hour(Bike$trip_start_time)) 
+```
+Most trips start between 10am and 6pm, with peaks at 8am and 5pm
+
+```{r, echo=FALSE}
+#Plot of bike trip by day of the week 
+Bike %>% count(Weekday = wday(trip_start_time, label = TRUE)) %>% 
+  ggplot(aes(x=Weekday, y=n, fill=Weekday))+
+  geom_col(fill="#66C2A5")+
+  ggtitle("Number of Trips by Day of the Week")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Day of the Week")+
+  ylab("Total Trips")+
+  scale_y_continuous(labels = scales::comma)+
+  geom_text(aes(label = n), size = 5, hjust = 1.3, colour = "white")+
+  theme(legend.position = "none")+
+  coord_flip()+theme_minimal()
+
+```
+
+There are more bike trips between Monday and Friday, than over the weekend.
+
+```{r, echo=FALSE}
+Bike %>% 
+  group_by(date = date(trip_start_time)) %>% 
+  count() %>% 
+  ggplot(aes(x=date, y=n))+
+  geom_point(colour="#66C2A5")+
+  geom_line(colour="#66C2A5")+
+  ggtitle("Number of Bike Trips Per Day in 2018")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Date")+
+  ylab("Total Trips")+theme_minimal()
+```
+
+The number of trips varies through the year, with more trips when the weather is warmer (May to October).
+
+The max number of trips was on June 20, 2018, with 13,303 trips.  Bike share offered free trips on Wednesdays for the month of June in 2018.  And June 20th was one of the free trip days (https://bikesharetoronto.com/news/june-2018-at-bike-share-toronto/).
+
+```{r}
+#Number of trips counted by week
+woy <- date(c("2018-01-01",
+              "2018-02-01",
+              "2018-03-01",
+              "2018-04-01",
+              "2018-05-01",
+              "2018-06-01",
+              "2018-07-01",
+              "2018-08-01",
+              "2018-09-01",
+              "2018-10-01",
+              "2018-11-01",
+              "2018-12-01"))
+
+woy <- tibble(mon = month(woy, label = T),
+              sem = week(woy)) %>% distinct(mon,sem)
+
+Bike %>% 
+  mutate(date = week(trip_start_time)) %>% 
+  group_by(date) %>% 
+  count() %>% 
+  ggplot(aes(date, n))+
+  geom_line(colour="#66C2A5", size=1) +
+  scale_x_continuous(breaks = woy$sem, labels = woy$mon) +
+  ggtitle("Number of Bike Trips Per Week in 2018")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Date")+
+  ylab("")+theme_minimal()
+
+```
+
+The number of trips varies through the year, with more trips when the weather is warmer (May to October). This trend doesn't vary by day of the week or user type. Everyone seems to prefer biking in the spring and summer.
+
+```{r}
+Bike %>% 
+  mutate(date = week(trip_start_time)) %>% 
+  group_by(date, WDay, user_type) %>%
+  count() %>% 
+  ggplot(aes(date, n))+
+  geom_line(aes(color=WDay), size=1) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(breaks = woy$sem, labels = woy$mon) +
+  ggtitle("Number of Bike Trips Per Week by user type and day of the week")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Date")+
+  theme_minimal()+
+  theme(legend.title = element_blank(), axis.title.y = element_blank())+
+  facet_grid(user_type~.)
+```
+
+## Analysis of the impact of weather on Bike Share ridership
+### Number of Bike Trips per day in 2018
+```{r}
+#Create dataframe of bike trips by date (using the start day to group by date)
+Bike_Count_2018 <- as.data.frame(Bike %>% group_by(date = date(trip_start_time)) %>% 
+                                   count())
+##alternative
+#Bike_Count_2018 <- as.data.frame(Bike %>% 
+#  group_by(date = date(trip_start_time), user_type, WDay)) %>% 
+#  count()) # count the trips that occur each day
+
+
+
+Bike_Count_2018$date <- ymd(Bike_Count_2018$date) #convert the date back to POSIXct
+Bike_Count_2018 <- rename(Bike_Count_2018, bike_trips = n) #rename the count column
+```
+
+
+
+### Load and clean weather data 
+```{r}
+#source https://climatedata.ca/ 
+weather_raw <- read.csv("climate-daily.csv", stringsAsFactors = F)
+weather_2018 <- weather_raw %>% 
+  filter(year(LOCAL_DATE)==2018)
+
+#Convert the date to date format (use the lubridate package)
+#start time and date
+weather_2018$LOCAL_DATE <-ymd_hms(weather_2018$LOCAL_DATE)
+```
+```{r, fig.align = "centre", fig.width=10}
+
+##check for records with incomplete cases
+sum(complete.cases(weather_2018))
+md.pattern(weather_2018, rotate.names = T)
+
+weather_2018_clean <-subset(weather_2018,select = -c(TOTAL_RAIN,
+                                                     TOTAL_RAIN_FLAG,
+                                                     TOTAL_SNOW,
+                                                     TOTAL_SNOW_FLAG,
+                                                     DIRECTION_MAX_GUST,
+                                                     DIRECTION_MAX_GUST_FLAG,
+                                                     SPEED_MAX_GUST,
+                                                     SPEED_MAX_GUST_FLAG))
+```
+
+Total_rain, total_snow, direction and speed of max gust all have data missing for all 365 days. These variables, which are completely missing, and their flags can be removed from the dataset.
+
+```{r, fig.align = "centre", fig.width=10}
+#recheck the data for missing values
+md.pattern(weather_2018_clean, rotate.names = T)
+summary(weather_2018_clean)
+```
+"Snow on the ground" and "relative humidity" have the most cases missing. Other variables have 18 or fewer records missing. 
+
+#### SNOW_ON_GROUND
+Snow on the ground has the most NAs at 268. 
+```{r}
+summarytools::freq(weather_2018_clean$SNOW_ON_GROUND_FLAG)
+```
+
+The only flag value for snow_on_ground indicates is T, which means trace or zero measurements, there are no flags for missing data.
+
+```{r}
+weather_2018_clean %>% 
+  group_by(LOCAL_MONTH) %>% 
+  count(is.na(SNOW_ON_GROUND)) %>% 
+  filter(`is.na(SNOW_ON_GROUND)`==T) #show number of days with Snow on the ground NA by month
+```
+
+From May to October, the measurment of snow on the ground is NA. Page  27 of the technical documentation states "Frequently, zero amounts are not entered on the document and are archived as missing. This deficiency is most evident after the last measured depth in the spring" (https://climate.weather.gc.ca/doc/Technical_Documentation.pdf ). Therefore, the NA values for this field will be replaced with 0.
+
+```{r}
+weather_2018_clean <- weather_2018_clean %>% 
+  replace_na(list(SNOW_ON_GROUND=0))
+```
+
+#### Relative Humidity
+The next highest values for NA are the min/max of relative humidity with 200 & 201 NAs, respectively.
+```{r}
+weather_2018_clean %>% 
+  group_by(LOCAL_MONTH) %>% 
+  count(is.na(MIN_REL_HUMIDITY)) %>% 
+  filter(`is.na(MIN_REL_HUMIDITY)`==T)
+
+weather_2018_clean %>% 
+  group_by(LOCAL_MONTH) %>% 
+  count(is.na(MAX_REL_HUMIDITY)) %>% 
+  filter(`is.na(MAX_REL_HUMIDITY)`==T)
+```
+The relative humidity data is missing before the middle of July, but is present from July to December. This data cannot be effectively imputed using the data from the second half of the year because the humidity in Toronto varies a lot between seasons.  The relative humidity variables will to be removed from the 2018 dataset. 
+
+
+#### Other variables
+Cooling and heating degree days are primarily used as the measures of energy consumption not weather. The 5 station location variables  have no variability in the dataset. These 7 variables were removed.
+```{r}
+cols_exclude <- c("COOLING_DEGREE_DAYS", "COOLING_DEGREE_DAYS_FLAG", "HEATING_DEGREE_DAYS","HEATING_DEGREE_DAYS_FLAG", "x","y","STATION_NAME","CLIMATE_IDENTIFIER", "PROVINCE_CODE","MIN_REL_HUMIDITY", "MIN_REL_HUMIDITY_FLAG","MAX_REL_HUMIDITY", "MAX_REL_HUMIDITY_FLAG")
+weather_2018_clean <- weather_2018_clean %>% 
+  dplyr::select(-one_of(cols_exclude))
+```
+
+
+With final variables excluded and data values cleaned, let's look at missing values one more time.
+```{r}
+md.pattern(weather_2018_clean, rotate.names = T)
+```
+
+### Impute Missing Data
+I compared two types of imputation methods kNN and regression.
+
+#### kNN Imputation
+```{r}
+weather_2018_imputed_knn <- kNN(weather_2018_clean, variable = c("SNOW_ON_GROUND", 
+                                                                 "MIN_TEMPERATURE", 
+                                                                 "MAX_TEMPERATURE", 
+                                                                 "MEAN_TEMPERATURE",
+                                                                 "TOTAL_PRECIPITATION"), k=5)
+
+weather_2018_imputed_knn <- subset(weather_2018_imputed_knn, select = -c(SNOW_ON_GROUND_imp, MIN_TEMPERATURE_imp, MAX_TEMPERATURE_imp, MEAN_TEMPERATURE_imp, TOTAL_PRECIPITATION_imp))
+```
+
+#### Regression imputation 
+```{r}
+weather_2018_clean <- as.data.frame(weather_2018_clean) 
+weather_2018_clean$MIN_TEMPERATURE <- as.numeric(weather_2018_clean$MIN_TEMPERATURE)
+weather_2018_clean$MAX_TEMPERATURE <- as.numeric(weather_2018_clean$MAX_TEMPERATURE)
+
+#step1 - min and max temperature from local month and local day
+weather_2018_imputed_reg <- regressionImp(MIN_TEMPERATURE+MAX_TEMPERATURE~LOCAL_DATE, weather_2018_clean)
+
+#step2 - imputing missing mean temperature values by taking the average of min and max temp 
+weather_2018_imputed_reg$MEAN_TEMPERATURE <- round((weather_2018_imputed_knn$MIN_TEMPERATURE+weather_2018_imputed_knn$MAX_TEMPERATURE)/2, 1)
+
+#step3 - Total precipitation from date + snow on the ground + min temp +max temp
+weather_2018_imputed_reg <- regressionImp(TOTAL_PRECIPITATION~LOCAL_DATE+SNOW_ON_GROUND+MIN_TEMPERATURE+MAX_TEMPERATURE, weather_2018_imputed_reg)
+
+weather_2018_imputed_reg<- weather_2018_imputed_reg %>% 
+  dplyr::select(-c( "MIN_TEMPERATURE_imp", 
+             "MAX_TEMPERATURE_imp", 
+             "TOTAL_PRECIPITATION_imp"))
+```
+
+#### Compare the imputation methods
+```{r}
+#create a column in each dataframe called impute_method 
+a<- weather_2018_clean %>% 
+  mutate(impute_method = "original")
+b<- weather_2018_imputed_knn %>% 
+  mutate(impute_method = "knn")
+c<- weather_2018_imputed_reg %>% 
+  mutate(impute_method = "reg")
+impute_df <- rbind(a,b,c)#create a dataframe combining the datasets 
+
+rm(a)
+rm(b)
+rm(c)
+```
+
+Plot overlapping density plots of the imputed variables
+```{r, echo=FALSE, warning=FALSE, fig.width=12 }
+par(mfrow = c(2,3))
+
+a <- impute_df %>% 
+  ggplot(aes(x=MIN_TEMPERATURE, colour = impute_method, fill = impute_method))+
+  geom_density(alpha=0.1, show.legend = F)+
+  ggtitle("Min Temperature")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("")+
+  theme(legend.title = element_blank())+ theme_minimal()
+
+b <- impute_df %>% 
+  ggplot(aes(x=MAX_TEMPERATURE, colour = impute_method, fill = impute_method))+
+  geom_density(alpha=0.1, show.legend = F)+
+  ggtitle("Max Temperature")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("")+
+  theme(legend.title = element_blank())+ theme_minimal()
+
+c <- impute_df %>% 
+  ggplot(aes(x=MEAN_TEMPERATURE, colour = impute_method, fill = impute_method))+
+  geom_density(alpha=0.1, show.legend = T)+
+  ggtitle("Mean Temperature")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("")+
+  theme_minimal()+
+  theme(legend.title = element_blank(), legend.position = "bottom")
+
+d <- impute_df %>% 
+  ggplot(aes(x=TOTAL_PRECIPITATION, colour = impute_method, fill = impute_method))+
+  geom_density(alpha=0.1, show.legend = F)+
+  ggtitle("Total Precipitation")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("")+
+  theme_minimal()+
+  theme(legend.title = element_blank())
+  
+grid.arrange(a,b,c,d, nrow = 2)
+
+```
+```{r}
+rm(a)
+rm(b)
+rm(c)
+rm(d)
+```
+
+
+The two methods of imputation produce similar results and are consistent with the original data. Either of the imputed datasets could be used for modelling. I choose kNN. 
+
+#### Cleaned weather data
+```{r}
+weather_2018_imputed_clean<- weather_2018_imputed_knn %>% 
+    select(-c( "MEAN_TEMPERATURE_FLAG", 
+               "MIN_TEMPERATURE_FLAG", 
+               "MAX_TEMPERATURE_FLAG",
+               "TOTAL_PRECIPITATION_FLAG",
+               "SNOW_ON_GROUND_FLAG",
+))
+```
+```{r}
+#Convert the date to date format (use the lubridate package)
+#start date
+weather_2018_imputed_clean$LOCAL_DATE <-ymd(weather_2018_imputed_clean$LOCAL_DATE)
+```
+```{r}
+#Link weather data to Bikecount2018
+bw_count_2018 <- left_join(Bike_Count_2018, weather_2018_imputed_clean, by = c("date"="LOCAL_DATE")) %>% select(-c("ID", "LOCAL_YEAR"))
+```
+
+Checking for correlations between the independent variables
+```{r}
+test_ind <- cor(bw_count_2018[,5:9])
+corrplot(test_ind,type="lower", col = brewer.pal(8,"Set2"), tl.col="black")
+```
+Snow on the group and total precipitation show low to moderate correlations with temperature. The three measures of temperature are very highly correlated. So only one will be selected for the analysis. 
+
+```{r}
+#checking the strength of the relationship between the temperature variables and bike trips
+cor(x=bw_count_2018$MEAN_TEMPERATURE, y=bw_count_2018$bike_trips)
+cor(x=bw_count_2018$MAX_TEMPERATURE, y=bw_count_2018$bike_trips)
+cor(x=bw_count_2018$MIN_TEMPERATURE, y=bw_count_2018$bike_trips)
+```
+Mean temperature has the strongest relationship with bike trips, so it will be used in further analyses.
+
+```{r}
+# scatter plot of the relationship between temperature and bike count
+bw_count_2018 %>% 
+  ggplot(aes(x=MEAN_TEMPERATURE,y=bike_trips))+
+  geom_point(col="#66C2A5", alpha=0.5)+
+  xlab("Mean Temperature")+
+  ylab("Daily Trips")+
+  labs(title = "Daily mean temperature vs. bike trips")+
+  theme_minimal()
+
+# scatter plot of the relationship between precipitation and bike count
+bw_count_2018 %>% 
+  ggplot(aes(x=TOTAL_PRECIPITATION,y=bike_trips))+
+  geom_point(col="#66C2A5", alpha=0.5)+
+  xlab("Total Precipitation")+
+  ylab("Daily Trips")+
+  labs(title = "Daily total precipitation vs. bike trips")+
+  theme_minimal()
+
+# scatter plot of the relationship between snow and bike count
+bw_count_2018 %>% 
+  ggplot(aes(x=SNOW_ON_GROUND,y=bike_trips))+
+  geom_point(col="#66C2A5", alpha=0.5)+
+  xlab("Snow on Ground")+
+  ylab("Daily Trips")+
+  labs(title = "Daily snow vs. bike trips")+
+  theme_minimal()
+
+cor(bw_count_2018$MEAN_TEMPERATURE,bw_count_2018$bike_trips)
+cor(bw_count_2018$TOTAL_PRECIPITATION,bw_count_2018$bike_trips)
+cor(bw_count_2018$SNOW_ON_GROUND,bw_count_2018$bike_trips, method = "spearman")
+```
+
+### Prediction Model
+
+The next step is to build a model to see if the number of Bike Share trips can be predicted by the weather, day of the week and user type. I was influenced by the work of Todd Schneider who built a model to predict the number of bike share trips in New York City based on the weather (https://toddwschneider.com/posts/a-tale-of-twenty-two-million-citi-bikes-analyzing-the-nyc-bike-share-system/#citibike-weather).
+
+I use a non-linear least-squares algorithm. In particular the nlsLM() function from the minpack.lm package to implement the Levenberg-Marquardt algorithm.
+
+#### Prepare a dataframe
+```{r}
+#Combine the daily weather stats (e.g., mean temperature, total precipitation and amount of snow on the ground) with the daily trip counts by date.  Create a variable for Weekday (1=yes, 0=no)and a variable for Season( 1-4)
+bw_count_2018 <- left_join(Bike_Count_2018, weather_2018_imputed_clean, by = c("date"="LOCAL_DATE")) %>% 
+                  select(-c("ID", "LOCAL_YEAR", "LOCAL_MONTH", "LOCAL_DAY")) %>% 
+                  mutate(WDay = ifelse((isWeekday(date)==T), 1, 0)) %>% 
+                  mutate(Season = quarter(bw_count_2018$date)) %>% 
+                  mutate(Season = replace(Season, Season==1,0)) %>% 
+                  mutate(Season = replace(Season, Season==2,10)) %>% 
+                  mutate(Season = replace(Season, Season==3,15)) %>% 
+                  mutate(Season = replace(Season, Season==4,5)) 
+#transformed the seasons to values that are ordered from least trips to most trips (Jan-March, Oct-Dec, Apr-June, July-Sept)
+```
+
+#### Create a model
+```{r}
+#creates the function for the s-curve used below
+scurve = function(x, center, width) {
+  1 / (1 + exp(-(x - center) / width))
+}
+
+# definte the model and start values for the Levenberg-Marquardt algorithm
+nls_model <- nlsLM(
+  bike_trips ~ exp(b_weekday * WDay) +
+    (b_season* Season)+
+    b_weather * scurve(
+      MEAN_TEMPERATURE + b_precip * log(1+TOTAL_PRECIPITATION) + b_snow * SNOW_ON_GROUND,
+      weather_scurve_center,
+      weather_scurve_width
+    ),
+  data = bw_count_2018,
+  start = list(b_weekday = 1,
+               b_season = 2,
+               b_weather = 5000,
+               b_precip = 1, b_snow = 1,
+               weather_scurve_center = 5,
+               weather_scurve_width = 20))
+#Summary stats for the model
+summary(nls_model)
+sqrt(mean(summary(nls_model)$residuals^2))
+
+```
+
+#### Plot comparing actual and predicted values for 2018
+```{r}
+weather_data <- bw_count_2018 %>%
+  mutate(predicted_nls = predict(nls_model, newdata = bw_count_2018),
+         resid = bike_trips - predicted_nls)
+
+#Plot of residuals
+hist(weather_data$resid, main = "Histogram of Residuals", col="#66C2A5",
+     xlab="Residual \n(actual-predicted)")
+
+# Predictions versus actuals
+ggplot(data = weather_data, aes(x = bike_trips, y = predicted_nls)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, color = "#FC8D62", size = 1) +
+  scale_x_continuous("\nActual trips per day") +
+  scale_y_continuous("Predicted trips per day\n") +
+  labs(title = "Bike Share Model Predictions vs Actual")+
+  expand_limits(y = 0, x = 0)+
+  theme_minimal()
+```
+
+Another way to look at the model is to plot predicted and actual trips through the year.
+```{r, warning=F, message=FALSE}
+#Actual # of trips per week
+actual <- weather_data %>% 
+  group_by(week(date)) %>% 
+  summarise(sum(bike_trips)) 
+#Predicted # of trips per week
+predicted <- weather_data %>% 
+  group_by(week(date)) %>% 
+  summarise(sum(predicted_nls)) 
+#Join the actual and predicted counts by date
+predicted_by_week <- full_join(actual, predicted) 
+names(predicted_by_week) <- c("week", "Actual", "Predicted") #rename the columns
+predicted_by_week <- gather(predicted_by_week, key, value, -week) #reshape into a long format for plotting
+predicted_by_week %>% 
+  ggplot(aes(x=week, y=value, color=key))+
+  geom_line(size=1) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(breaks = woy$sem, labels = woy$mon) +
+  ggtitle("Predicted vs Actual Bike Trips Per Week in 2018")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Date")+
+  ylab("")+theme_minimal()+
+  theme(legend.title = element_blank())
+```
+
+
+### Testing the model on 2017 Bike Share and weather data
+```{r}
+## Load Bike Share Data for 2017
+#Working directory
+setwd("~/BikeShare")
+
+#Data source: https://open.toronto.ca/dataset/bike-share-toronto-ridership-data/ 
+Q1Bike <- read.csv("Data/Bikeshare Ridership (2017 Q1).csv", stringsAsFactors = F)
+Q2Bike <- read.csv("Data/Bikeshare Ridership (2017 Q2).csv", stringsAsFactors = F)
+Q3Bike <- read.csv("Data/Bikeshare Ridership (2017 Q3).csv", stringsAsFactors = F)
+Q4Bike <- read.csv("Data/Bikeshare Ridership (2017 Q4).csv", stringsAsFactors = F)
+
+#Note: the format for dates varies across the 4 quarters, so conversion from 
+#character to POSIXct must be done before merging the data across quarters.
+#Convert the date to date format (use the lubridate package)#start time and date
+Q1Bike$trip_start_time <-dmy_hm(Q1Bike$trip_start_time)
+Q2Bike$trip_start_time <-dmy_hm(Q2Bike$trip_start_time)
+Q3Bike$trip_start_time <-mdy_hm(Q3Bike$trip_start_time)
+Q4Bike$trip_start_time <-mdy_hms(Q4Bike$trip_start_time)
+#stop time and date
+Q1Bike$trip_stop_time <-dmy_hm(Q1Bike$trip_stop_time)
+Q2Bike$trip_stop_time <-dmy_hm(Q2Bike$trip_stop_time)
+Q3Bike$trip_stop_time <-mdy_hm(Q3Bike$trip_stop_time)
+Q4Bike$trip_stop_time <-mdy_hms(Q4Bike$trip_stop_time)
+
+#Combine records from Q1 to Q4
+Bike2017 <- bind_rows(Q1Bike, Q2Bike, Q3Bike, Q4Bike)
+
+#Check for records with incomplete cases
+sum(complete.cases(Bike2017))
+
+summary(Bike2017)
+#Convert user_type to factor
+Bike2017$user_type <- as.factor(Bike2017$user_type)
+
+#Data source: https://climatedata.ca/download/
+weather_2017 <- weather_raw %>% 
+  filter(year(LOCAL_DATE)==2017)
+
+#Convert the date to date format (use the lubridate package)
+#start time and date
+weather_2017$LOCAL_DATE <-ymd_hms(weather_2017$LOCAL_DATE)
+
+##check for records with incomplete cases
+sum(complete.cases(weather_2017))
+weather_2017_clean <-subset(weather_2017,select = c(ID, 
+                                                    LOCAL_DATE,
+                                                    LOCAL_YEAR,
+                                                    LOCAL_MONTH,
+                                                    LOCAL_DAY,
+                                                    MEAN_TEMPERATURE,
+                                                    MIN_TEMPERATURE,
+                                                    MAX_TEMPERATURE,
+                                                    TOTAL_PRECIPITATION,
+                                                    SNOW_ON_GROUND))
+md.pattern(weather_2017_clean, rotate.names = T)
+
+weather_2017_imputed_knn <- kNN(weather_2017_clean, variable = c("SNOW_ON_GROUND", 
+                                                                 "MIN_TEMPERATURE", 
+                                                                 "MAX_TEMPERATURE", 
+                                                                 "MEAN_TEMPERATURE",
+                                                                 "TOTAL_PRECIPITATION"), k=5)
+
+weather_2017_imputed_clean <- subset(weather_2017_imputed_knn, select = -c(SNOW_ON_GROUND_imp, 
+                                                                         MIN_TEMPERATURE_imp, 
+                                                                         MAX_TEMPERATURE_imp, 
+                                                                         MEAN_TEMPERATURE_imp, 
+                                                                         TOTAL_PRECIPITATION_imp))
+
+#Convert the date to date format (use the lubridate package)
+#start date
+weather_2017_imputed_clean$LOCAL_DATE <-ymd(weather_2017_imputed_clean$LOCAL_DATE)
+
+#### Combine clean weather and available bike count for 2017
+#Create dataframe of bike trips by date (using the start day to group by date)
+Bike_Count_2017 <- as.data.frame(Bike2017 %>% group_by(date = date(trip_start_time)) %>% 
+                                   count())
+Bike_Count_2017$date <- ymd(Bike_Count_2017$date) #convert the date back to POSIXct
+Bike_Count_2017 <- rename(Bike_Count_2017, bike_trips = n) #rename the count column
+
+#Link weather data to Bikecount2017
+bw_count_2017 <- left_join(Bike_Count_2017, weather_2017_imputed_clean, by = c("date"="LOCAL_DATE")) %>% 
+  select(-c("ID", "LOCAL_YEAR", "LOCAL_MONTH", "LOCAL_DAY")) %>% 
+  mutate(WDay = ifelse((isWeekday(date)==T), 1, 0)) %>% 
+  mutate(Season = quarter(date)) %>% 
+  mutate(Season = replace(Season, Season==1,0)) %>% 
+  mutate(Season = replace(Season, Season==2,10)) %>% 
+  mutate(Season = replace(Season, Season==3,15)) %>% 
+  mutate(Season = replace(Season, Season==4,5)) 
+
+
+#model 2017 data using the non-linear model developed
+weather_data_2017 <- bw_count_2017 %>%
+  mutate(predicted_nls = predict(nls_model, newdata = bw_count_2017),
+         resid = bike_trips - predicted_nls)
+
+ggplot(data = weather_data_2017, aes(x = bike_trips, y = predicted_nls)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, color = "#FC8D62", size = 1) +
+  scale_x_continuous("\nActual trips per day") +
+  scale_y_continuous("Predicted trips per day\n") +
+  labs(title = "Bike Share Model Predictions vs Actual")+
+  expand_limits(y = 0, x = 0)+
+  theme_minimal()
+
+
+actual <- weather_data_2017 %>% 
+  group_by(week(date)) %>% 
+  summarise(sum(bike_trips)) 
+
+predicted <- weather_data_2017 %>% 
+  group_by(week(date)) %>% 
+  summarise(sum(predicted_nls)) 
+
+predicted_by_week <- full_join(actual, predicted) 
+
+names(predicted_by_week) <- c("week", "Actual", "Predicted")
+
+predicted_by_week <- gather(predicted_by_week, key, value, -week)
+
+
+predicted_by_week %>% 
+  ggplot(aes(x=week, y=value, color=key))+
+  geom_line(size=1) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(breaks = woy$sem, labels = woy$mon) +
+  ggtitle("Predicted vs Actual Bike Trips Per week in 2017")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Date")+
+  ylab("")+theme_minimal()+
+  theme(legend.title = element_blank())
+```
