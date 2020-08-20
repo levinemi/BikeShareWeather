@@ -14,4 +14,4 @@ There is 1 Rmd code file for this project. Once the data files are downloaded to
 directory is set in R Studio, load and run the "BikeShare_Weather - Clean.Rmd".
 
 ***Report***
-Summary Report Bike Share Toronto Weather.pdf is a report summarizing the model develop and findings.  
+Summary Report Bike Share Toronto Weather.pdf is a report summarizing the model development and findings.  
